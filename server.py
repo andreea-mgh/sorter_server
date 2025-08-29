@@ -27,8 +27,8 @@ def crop_mask():
     # hsv
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    lower_green = np.array([30, 20, 30])
-    upper_green = np.array([90, 255, 255])
+    lower_green = np.array([20, 20, 45])
+    upper_green = np.array([125, 255, 255])
 
     mask = cv2.inRange(hsv, lower_green, upper_green)
 
@@ -129,15 +129,16 @@ def process_image():
     mean = mean[0][0]
     std = std[0][0]
 
-    if std < 15:
+    if std < 8:
         print("No object detected.")
         chosen_number = 0
         waiting = False
         status = "idle"
         return
 
-    obj_thresh = cv2.threshold(diff, mean+0.1*(255-mean), 255, cv2.THRESH_BINARY)[1]
-    obj_thresh = cv2.cvtColor(obj_thresh, cv2.COLOR_BGR2GRAY)
+    obj_thresh = cv2.threshold(diff, mean+0.05*(255-mean), 255, cv2.THRESH_BINARY)[1]
+    # obj_thresh = cv2.threshold(diff, mean, 255, cv2.THRESH_BINARY)[1]
+    # obj_thresh = cv2.cvtColor(obj_thresh, cv2.COLOR_BGR2GRAY)
     obj_thresh[obj_thresh > 0] = 255
 
     # morphex obj
@@ -148,8 +149,20 @@ def process_image():
 
 
     # draw obj_thresh over image
-    img_masked = cv2.bitwise_and(img, img, mask=obj_thresh)
-    cv2.imwrite("uploads/received_image_processed.jpg", img_masked)
+    # img_masked = cv2.bitwise_and(img, img, mask=obj_thresh)
+
+
+    # make square that contains biggest area in obj_thresh
+    contours, _ = cv2.findContours(obj_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest_contour)
+
+        img_masked = img[y:y+h, x:x+w]
+
+        cv2.imwrite("uploads/received_image_processed.jpg", img_masked)
+    else:
+        print("No object contour detected.")
 
     # edges = cv2.Canny(diff, 40, 80)
     # # expand
@@ -240,13 +253,6 @@ def initialize():
     img = cv2.fastNlMeansDenoisingColored(img, None, 20, 30, 7, 21)
     cv2.imwrite(os.path.join(UPLOAD_FOLDER, "initial_image.jpg"), img)
 
-    # green_channel = img[:, :, 1]
-    # red_channel = img[:, :, 2]
-    # blue_channel = img[:, :, 0]
-    # mask = ((green_channel > red_channel) & (green_channel > blue_channel) & (green_channel > 100)).astype(np.uint8) * 255
-    
-    # cv2.imwrite(os.path.join(UPLOAD_FOLDER, "surface_mask.jpg"), mask)
-
     threading.Thread(target=crop_mask).start()
 
     status = "idle"
@@ -284,7 +290,7 @@ def pick_number():
     """Webpage for the user to pick a number based on the uploaded image."""
 
 
-    return render_template("pick.html", waiting=waiting, image_url="/uploads/received_image_contours.jpg", mask="/uploads/received_image_masked.jpg")
+    return render_template("pick.html", waiting=waiting, image_url="/uploads/received_image_processed.jpg", mask="/uploads/received_image_masked.jpg")
 
 
 @app.route('/uploads/<filename>')
