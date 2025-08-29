@@ -1,24 +1,58 @@
 from flask import Flask, request, jsonify, render_template
 import cv2
+import joblib
 import numpy as np
 import os
 import time
 
+from skimage.feature import hog, local_binary_pattern
+from skimage import morphology
+
+
 import threading
+
+
+from sorter_training_ml import retrain_svm
 
 app = Flask(__name__)
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Shared state (simple in-memory store for demo)
-chosen_number = None
+# shared state
+chosen_number = 0
 waiting = False
 status = "starting"
 
 model = "model_1"
+model_classes = 3
+
+retrain_svm(model, model_classes)
+
+svm_clf = joblib.load(f"models/{model}_svm_model.joblib")
+pca = joblib.load(f"models/{model}_pca_transform.joblib")
 
 mask_processed = False
+
+
+def extract_features(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.resize(img, (128, 128))
+
+    hog_feat = hog(img, pixels_per_cell=(16,16), cells_per_block=(2,2),
+                   orientations=9, block_norm='L2-Hys', feature_vector=True)
+
+    lbp = local_binary_pattern(img, P=8, R=1, method="uniform")
+    (hist, _) = np.histogram(lbp.ravel(),
+                             bins=np.arange(0, 8 + 3),
+                             range=(0, 8 + 2))
+    hist = hist.astype("float")
+    hist /= (hist.sum() + 1e-6)
+
+    return np.hstack([hog_feat, hist])
+
+
+
 
 def crop_mask():
     global mask_processed
@@ -32,27 +66,17 @@ def crop_mask():
 
     mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    kernel = np.ones((15, 15), np.uint8)
+    cv2.imwrite("uploads/surface_mask_raw.jpg", mask)
 
-    # Perform morphological closing
-    morphex_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    # row_sums = np.sum(mask, axis=1) / np.shape(mask)[1]
-    # col_sums = np.sum(mask, axis=0) / np.shape(mask)[0]
+    # kernel = np.ones((15, 15), np.uint8)
 
-    # thresh = 80
-    # top_edge = np.argmax(row_sums > thresh)
-    # bottom_edge = len(row_sums) - np.argmax(row_sums[::-1] > thresh) - 1
-    # left_edge = np.argmax(col_sums > thresh)
-    # right_edge = len(col_sums) - np.argmax(col_sums[::-1] > thresh) - 1
+    # morphex_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
+    selem = np.ones((15, 15), np.uint8)
+    morphex_mask = morphology.binary_closing(mask, selem)
 
-    # mask[:top_edge, :] = 0
-    # mask[bottom_edge:, :] = 0
-    # mask[:, :left_edge] = 0
-    # mask[:, right_edge:] = 0
-
-    cv2.imwrite("uploads/surface_mask.jpg", morphex_mask)
+    cv2.imwrite("uploads/surface_mask.jpg", morphex_mask.astype(np.uint8) * 255)
     mask_processed = True
 
 
@@ -77,17 +101,17 @@ def blockwise_detail(image, block_size=64):
     return details
 
 def process_image():
-    global chosen_number, waiting, status
-
+    global chosen_number, waiting, status, mask_processed
+    
+    while not mask_processed:
+        time.sleep(0.1)
+    
     correction = True
 
     img_init = cv2.imread("uploads/initial_image.jpg")
     img = cv2.imread("uploads/received_image.jpg")
 
     mask = cv2.imread("uploads/surface_mask.jpg", cv2.IMREAD_GRAYSCALE)
-
-
-    # Color correction
 
     if correction:
         img = img.astype(np.float32)
@@ -108,11 +132,8 @@ def process_image():
 
 
     diff = cv2.absdiff(img_init, img)
-
     diff = cv2.bitwise_and(diff, diff, mask=mask)
-
-    # mai putin verde
-    diff[:, :, 1] = (diff[:, :, 1] * 0.5).astype(np.uint8)
+    diff[:, :, 1] = (diff[:, :, 1] * 0.2).astype(np.uint8)
 
     # mean = cv2.mean(diff, mask=mask)
     # print(f"Mean difference: {mean}")
@@ -129,7 +150,7 @@ def process_image():
     mean = mean[0][0]
     std = std[0][0]
 
-    if std < 8:
+    if std < 5:
         print("No object detected.")
         chosen_number = 0
         waiting = False
@@ -142,106 +163,63 @@ def process_image():
     obj_thresh[obj_thresh > 0] = 255
 
     # morphex obj
-    kernel = np.ones((7, 7), np.uint8)
-    obj_thresh = cv2.morphologyEx(obj_thresh, cv2.MORPH_CLOSE, kernel)
+    # kernel = np.ones((7, 7), np.uint8)
+    # obj_thresh = cv2.morphologyEx(obj_thresh, cv2.MORPH_CLOSE, kernel)
+    selem = np.ones((7, 7), np.uint8)
+    obj_thresh = morphology.binary_closing(obj_thresh, selem)
 
     cv2.imwrite("uploads/received_image_masked.jpg", obj_thresh)
 
 
-    # draw obj_thresh over image
-    # img_masked = cv2.bitwise_and(img, img, mask=obj_thresh)
-
-
     # make square that contains biggest area in obj_thresh
     contours, _ = cv2.findContours(obj_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
-
-        img_masked = img[y:y+h, x:x+w]
-
-        cv2.imwrite("uploads/received_image_processed.jpg", img_masked)
-    else:
+    if not contours:
         print("No object contour detected.")
+        chosen_number = 0
+        waiting = False
+        status = "idle"
+        return
 
-    # edges = cv2.Canny(diff, 40, 80)
-    # # expand
-    # kernel = np.ones((5, 5), np.uint8)
-    # edges = cv2.dilate(edges, kernel, iterations=1)
-    # cv2.imwrite("uploads/received_image_edges.jpg", edges)
+    largest_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
 
-    # # density map of edges
-    # density = detail_measure(edges)
-    # # draw map
-    # print(f"Edge density: {density}")
+    img_masked = img[y:y+h, x:x+w]
 
-    # contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # if not contours:
-    #     print("No object detected.")
-    #     chosen_number = 0
-    #     waiting = False
-    #     status = "idle"
-    #     return
-    
-    # largest_contour = max(contours, key=cv2.contourArea)
-    # area = cv2.contourArea(largest_contour)
-
-    # if area < 3000:
-    #     print(f"Object too small. Area: {area}")
-    #     chosen_number = 0
-    #     waiting = False
-    #     status = "idle"
-    #     return
-    
-    # print(f"Object detected. Area: {area}")
-    
-    # cv2.drawContours(img, [largest_contour], -1, (0, 255, 0), 2)
-    # cv2.imwrite("uploads/received_image_contours.jpg", img)
-    
-
-    # if meanmax < 50:
-    #     print("No object detected.")
-    #     chosen_number = 0
-    #     waiting = False
-    #     status = "idle"
-    #     return
+    cv2.imwrite("uploads/received_image_processed.jpg", img_masked)
 
     print("Object detected.")
 
-    # find center of mass
-    # M = cv2.moments(obj_thresh)
-    # if M["m00"] == 0:
-    #     cx, cy = 0, 0
-    # else:
-    #     cx = int(M["m10"] / M["m00"])
-    #     cy = int(M["m01"] / M["m00"])
-    # print(f"Center of mass: ({cx}, {cy})")
-    # # save received_image with labeled center
-    # cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
-    # cv2.imwrite("uploads/received_image_labeled.jpg", img)
+    # increase contrast, grayscale, resize to new size
+    img_masked = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
+    img_masked = cv2.equalizeHist(img_masked)
+    img_masked = cv2.resize(img_masked, (128, 128))
+
+    cv2.imwrite("uploads/model_input.jpg", img_masked)
 
 
-    # contours
-    # diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    # contours, _ = cv2.findContours(diff_gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # if contours:
-    #     # Find the largest contour
-    #     largest_contour = max(contours, key=cv2.contourArea)
-    #     # Draw the largest contour on the image
-    #     cv2.drawContours(img, [largest_contour], -1, (0, 255, 0), 2)
-    #     cv2.imwrite("uploads/received_image_contours.jpg", img)
+    feat = extract_features("uploads/model_input.jpg")
+    feat_reduced = pca.transform(feat.reshape(1, -1))
 
-    # blockwise detail
-    # block_details = blockwise_detail(diff)
-    # for (x, y), score in block_details:
-    #     print(f"Block at ({x}, {y}) has detail score: {score}")
+    scores = svm_clf.decision_function(feat_reduced)
+    print("Decision scores:", scores)
 
-    # # make image with block details
-    # detail_image = np.zeros_like(diff)
-    # for (x, y), score in block_details:
-    #     cv2.putText(detail_image, f"{score:.2f}", (x, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    probs = svm_clf.predict_proba(feat_reduced)
+    print("Class probabilities:", probs[0])
 
-    # cv2.imwrite("uploads/received_image_details.jpg", detail_image)
+    max_prob = np.max(probs)
+    chosen_number = int(np.argmax(probs) + 1)
+
+    if max_prob > 0.75:
+        print(f"Confidently predicted class: {chosen_number} with probability: {max_prob}")
+        dest_folder = os.path.join(model, str(chosen_number))
+        os.makedirs(dest_folder, exist_ok=True)
+        os.rename("uploads/model_input.jpg", os.path.join(dest_folder, f"{int(time.time())}.jpg"))
+        status = "idle"
+    
+    else:
+        print(f"Unconfident prediction: {chosen_number} with probability: {max_prob}")
+        status = "user_input"
+
 
 @app.route('/init', methods=['POST'])
 def initialize():
@@ -254,7 +232,7 @@ def initialize():
     cv2.imwrite(os.path.join(UPLOAD_FOLDER, "initial_image.jpg"), img)
 
     threading.Thread(target=crop_mask).start()
-
+    mask_processed = False
     status = "idle"
 
     return jsonify({"message": "Image received and processed successfully!"})
@@ -273,9 +251,6 @@ def upload_image():
 
     cv2.imwrite("uploads/received_image.jpg", img)
 
-    while not mask_processed:
-        time.sleep(0.1)
-
     threading.Thread(target=process_image).start()
 
     chosen_number = None
@@ -290,7 +265,7 @@ def pick_number():
     """Webpage for the user to pick a number based on the uploaded image."""
 
 
-    return render_template("pick.html", waiting=waiting, image_url="/uploads/received_image_processed.jpg", mask="/uploads/received_image_masked.jpg")
+    return render_template("pick.html", image_url="/uploads/received_image_processed.jpg")
 
 
 @app.route('/uploads/<filename>')
@@ -302,19 +277,20 @@ def serve_file(filename):
 def answer():
     """Receive the number picked by the user from the webpage."""
     print("Received answer")
-    global chosen_number, waiting
+    global chosen_number, waiting, status
     number = request.form.get("number")
     if number is None:
         return "No number provided.", 400
 
     chosen_number = int(number)
+    status = "idle"
     waiting = False
 
-    # save image in data/
-    dest_folder = os.path.join(model, str(chosen_number))
-    os.makedirs(dest_folder, exist_ok=True)
-    if chosen_number:
-        os.rename("uploads/received_image.jpg", os.path.join(dest_folder, f"{int(time.time())}.jpg"))
+    if chosen_number > 0 and chosen_number <= model_classes:
+
+        dest_folder = os.path.join(model, str(chosen_number))
+        os.makedirs(dest_folder, exist_ok=True)
+        os.rename("uploads/model_input.jpg", os.path.join(dest_folder, f"{int(time.time())}.jpg"))
 
     return f"Thanks! You picked {chosen_number}"
 
@@ -331,9 +307,9 @@ def receive_status():
 
 @app.route('/result', methods=['GET'])
 def get_result():
-    if waiting:
+    if status == "processing" or status == "user_input":
         print("Image is still being processed...")
-        return jsonify({"status": "waiting"})
+        return jsonify({"status": status})
     print(f"Returning chosen number: {chosen_number}")
     return jsonify({"result": chosen_number, "status": "ready"})
 
