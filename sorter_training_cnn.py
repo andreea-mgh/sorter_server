@@ -4,9 +4,9 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras import regularizers
 
-# -----------------------
-# Data Generators
-# -----------------------
+import matplotlib.pyplot as plt
+
+# data generator cu augmentation
 train_datagen = ImageDataGenerator(
     rescale=1./255,
     rotation_range=20,
@@ -20,7 +20,7 @@ train_datagen = ImageDataGenerator(
 train_generator = train_datagen.flow_from_directory(
     "model_1", 
     target_size=(128, 128),
-    color_mode="grayscale",   # since images are black & white
+    color_mode="grayscale",
     batch_size=16,
     class_mode="categorical",
     subset="training"
@@ -35,9 +35,7 @@ val_generator = train_datagen.flow_from_directory(
     subset="validation"
 )
 
-# -----------------------
-# Small CNN Model
-# -----------------------
+# cnn micutz
 model = models.Sequential([
     layers.Conv2D(32, (3, 3), activation='relu', input_shape=(128, 128, 1),
                   kernel_regularizer=regularizers.l2(0.001)),
@@ -60,20 +58,15 @@ model = models.Sequential([
     layers.Flatten(),
     layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
     layers.Dropout(0.5),
-    layers.Dense(3, activation='softmax')  # 3 classes
+    layers.Dense(3, activation='softmax')  # 3 clase
 ])
 
-# -----------------------
-# Compile
-# -----------------------
+
 model.compile(optimizer='adam',
               loss='categorical_crossentropy',
               metrics=['accuracy'])
 
-# -----------------------
-# Train
-# -----------------------
-
+# important
 early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
 history = model.fit(
@@ -83,9 +76,9 @@ history = model.fit(
     callbacks=[early_stop]
 )
 
-import matplotlib.pyplot as plt
 
-# Plot training & validation accuracy
+
+
 plt.figure(figsize=(12,5))
 
 # Accuracy

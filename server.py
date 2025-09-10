@@ -13,6 +13,7 @@ import threading
 
 
 from sorter_training_ml import retrain_svm
+from sklearn.decomposition import PCA as PCA
 
 app = Flask(__name__)
 
@@ -30,7 +31,7 @@ model_classes = 3
 retrain_svm(model, model_classes)
 
 svm_clf = joblib.load(f"models/{model}_svm_model.joblib")
-pca = joblib.load(f"models/{model}_pca_transform.joblib")
+training_pca = joblib.load(f"models/{model}_pca_transform.joblib")
 
 mask_processed = False
 
@@ -58,47 +59,31 @@ def crop_mask():
     global mask_processed
 
     img = cv2.imread('uploads/initial_image.jpg')
-    # hsv
+
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    lower_green = np.array([20, 20, 45])
-    upper_green = np.array([125, 255, 255])
-
+    lower_green = np.array([30, 20, 70])
+    upper_green = np.array([110, 255, 255])
     mask = cv2.inRange(hsv, lower_green, upper_green)
 
     cv2.imwrite("uploads/surface_mask_raw.jpg", mask)
 
     # kernel = np.ones((15, 15), np.uint8)
-
     # morphex_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-
-    selem = np.ones((15, 15), np.uint8)
+    selem = np.ones((50, 50), np.uint8)
     morphex_mask = morphology.binary_closing(mask, selem)
+
+    # sterge praful
+    morphex_mask = morphology.remove_small_objects(morphex_mask.astype(bool), min_size=100000) 
+    # micsorare pt margini
+    selem = np.ones((50, 50), np.uint8)
+    morphex_mask = morphology.binary_erosion(morphex_mask, selem)
+
 
     cv2.imwrite("uploads/surface_mask.jpg", morphex_mask.astype(np.uint8) * 255)
     mask_processed = True
 
 
-
-def detail_measure(image, ksize=3):
-
-    if len(image.shape) == 2:
-        gray = image
-    else:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F, ksize=ksize)
-    return laplacian.var()
-
-def blockwise_detail(image, block_size=64):
-    h, w = image.shape[:2]
-    details = []
-    for y in range(0, h, block_size):
-        for x in range(0, w, block_size):
-            block = image[y:y+block_size, x:x+block_size]
-            score = detail_measure(block)
-            details.append(((x,y), score))
-    return details
 
 def process_image():
     global chosen_number, waiting, status, mask_processed
@@ -133,45 +118,68 @@ def process_image():
 
     diff = cv2.absdiff(img_init, img)
     diff = cv2.bitwise_and(diff, diff, mask=mask)
-    diff[:, :, 1] = (diff[:, :, 1] * 0.2).astype(np.uint8)
+    # diff[:, :, 1] = (diff[:, :, 1] * 0.2).astype(np.uint8)
 
-    # mean = cv2.mean(diff, mask=mask)
-    # print(f"Mean difference: {mean}")
-
-    # meanmax = max(mean)
 
     cv2.imwrite("uploads/difference_image.jpg", diff)
+
+    # PCA pe diferenta
+
+    mean = cv2.mean(diff, mask=mask)
+    centered_diff = diff - mean[:3]
+    # pentru a reduce zgomotul de fundal
+    centered_diff[np.abs(centered_diff) < 8] = 0
+
+    pca = PCA(n_components=1)
+    reduced_data = pca.fit_transform(centered_diff.reshape(-1, 3))
+
+    pca_img_raw = reduced_data.reshape(diff.shape[0], diff.shape[1])
+    pca_img = cv2.normalize(pca_img_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    cv2.imwrite("uploads/difference_image_pca.jpg", pca_img_raw)
+
+
     diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-
-
     mean, std = cv2.meanStdDev(diff, mask=mask)
+
+    # pca_img = cv2.cvtColor(pca_img, cv2.COLOR_BGR2GRAY)
+    # mean, std = cv2.meanStdDev(pca_img_rawz, mask=mask)
 
     print(f"Mean: {mean}, Std: {std}")
     mean = mean[0][0]
     std = std[0][0]
 
-    if std < 5:
+    if std < 11.5 or mean < 7:
         print("No object detected.")
         chosen_number = 0
         waiting = False
         status = "idle"
         return
 
-    obj_thresh = cv2.threshold(diff, mean+0.05*(255-mean), 255, cv2.THRESH_BINARY)[1]
-    # obj_thresh = cv2.threshold(diff, mean, 255, cv2.THRESH_BINARY)[1]
-    # obj_thresh = cv2.cvtColor(obj_thresh, cv2.COLOR_BGR2GRAY)
-    obj_thresh[obj_thresh > 0] = 255
+    
+    # threshold cu Otsu
 
-    # morphex obj
-    # kernel = np.ones((7, 7), np.uint8)
-    # obj_thresh = cv2.morphologyEx(obj_thresh, cv2.MORPH_CLOSE, kernel)
-    selem = np.ones((7, 7), np.uint8)
+    otsu,_ = cv2.threshold(pca_img[mask > 0], 0, 255,cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    obj_thresh = np.zeros_like(pca_img)
+    obj_thresh[pca_img >= otsu] = 255
+
+    # masked_pca_img = np.where(mask > 0, pca_img, 0)
+    # _, obj_thresh = cv2.threshold(masked_pca_img.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    
+    # sterge praful
+    obj_thresh = morphology.remove_small_objects(obj_thresh.astype(bool), min_size=250)
+    obj_thresh = obj_thresh.astype(np.uint8) * 255
+    # asta cica inchide gaurile
+    selem = np.ones((25, 25), np.uint8)
     obj_thresh = morphology.binary_closing(obj_thresh, selem)
+    obj_thresh = obj_thresh.astype(np.uint8) * 255
 
     cv2.imwrite("uploads/received_image_masked.jpg", obj_thresh)
 
 
-    # make square that contains biggest area in obj_thresh
+    
+
     contours, _ = cv2.findContours(obj_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         print("No object contour detected.")
@@ -187,9 +195,16 @@ def process_image():
 
     cv2.imwrite("uploads/received_image_processed.jpg", img_masked)
 
+    if w < 20 or h < 20:
+        print("Detected object too small.")
+        chosen_number = 0
+        waiting = False
+        status = "idle"
+        return
+
     print("Object detected.")
 
-    # increase contrast, grayscale, resize to new size
+    # procesare aici
     img_masked = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
     img_masked = cv2.equalizeHist(img_masked)
     img_masked = cv2.resize(img_masked, (128, 128))
@@ -198,7 +213,7 @@ def process_image():
 
 
     feat = extract_features("uploads/model_input.jpg")
-    feat_reduced = pca.transform(feat.reshape(1, -1))
+    feat_reduced = training_pca.transform(feat.reshape(1, -1))
 
     scores = svm_clf.decision_function(feat_reduced)
     print("Decision scores:", scores)
@@ -209,7 +224,7 @@ def process_image():
     max_prob = np.max(probs)
     chosen_number = int(np.argmax(probs) + 1)
 
-    if max_prob > 0.75:
+    if max_prob > 0.82:
         print(f"Confidently predicted class: {chosen_number} with probability: {max_prob}")
         dest_folder = os.path.join(model, str(chosen_number))
         os.makedirs(dest_folder, exist_ok=True)
@@ -223,6 +238,7 @@ def process_image():
 
 @app.route('/init', methods=['POST'])
 def initialize():
+    global mask_processed, status
     if not request.data:
         return jsonify({"error": "No data received"}), 400
 
@@ -241,7 +257,6 @@ def initialize():
 @app.route('/upload', methods=['POST'])
 def upload_image():
     global chosen_number, waiting, status
-
     if not request.data:
         return jsonify({"error": "No data received"}), 400
 
@@ -262,10 +277,8 @@ def upload_image():
 
 @app.route('/pick')
 def pick_number():
-    """Webpage for the user to pick a number based on the uploaded image."""
-
-
-    return render_template("pick.html", image_url="/uploads/received_image_processed.jpg")
+    return render_template("pick.html",
+        image_url="/uploads/received_image_processed.jpg")
 
 
 @app.route('/uploads/<filename>')
@@ -307,7 +320,10 @@ def receive_status():
 
 @app.route('/result', methods=['GET'])
 def get_result():
-    if status == "processing" or status == "user_input":
+    if status == "user_input":
+        print("Waiting for user input...")
+        return jsonify({"status": status, "guess": chosen_number})
+    if status == "processing":
         print("Image is still being processed...")
         return jsonify({"status": status})
     print(f"Returning chosen number: {chosen_number}")
